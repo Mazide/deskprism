@@ -1,0 +1,13 @@
+build/
+__pycache__/
+.venv/
+
+# Local credentials and compiled firmware (may contain API keys)
+secrets.h
+.env
+.env.*
+*.bin
+*.elf
+*.map
+*.hex
+*.uf2
