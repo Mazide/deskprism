@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <algorithm>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
@@ -17,7 +18,15 @@
 #include "ble_transport.h"
 #include "command_protocol.h"
 
-Adafruit_ST7789 display(&SPI,config::tftCs,config::tftDc,config::tftRst);
+class PrismDisplay : public Adafruit_ST7789 {
+ public:
+  using Adafruit_ST7789::Adafruit_ST7789;
+
+ protected:
+  // init() calls begin() before sending the first panel command.
+  void begin(uint32_t) override { Adafruit_ST77xx::begin(config::tftInitHz); }
+};
+PrismDisplay display(&SPI,config::tftCs,config::tftDc,config::tftRst);
 FrameCanvas canvas;
 optics::Brightness brightness;
 status::Display statuses;
@@ -29,7 +38,7 @@ ble::Transport bluetooth;
 QueueHandle_t commands=nullptr;
 protocol::LineBuffer usbFrame;
 bool storageOk=true,bleOk=false,networkOk=false;
-uint32_t lastFrame=0,lastSaveAttempt=0,lastHealth=0;
+uint32_t lastSaveAttempt=0,lastHealth=0,completedFrames=0;
 char usbOutput[768]={};size_t usbOutputSize=0,usbOutputAt=0;
 
 struct Button {
@@ -61,14 +70,18 @@ uint32_t currentDay() {
   return (local.tm_year+1900)*10000+(local.tm_mon+1)*100+local.tm_mday;
 }
 void showStatus(status::State value) {statuses.show(value,millis());}
-void presentCanvas() {
+void presentRows(unsigned first, unsigned count) {
   const uint16_t* source=canvas.getBuffer();
-  uint16_t row[config::screenWidth];
-  display.startWrite();display.setAddrWindow(0,0,config::screenWidth,config::screenHeight);
-  for(int y=0;y<config::screenHeight;++y) {
-    for(int x=0;x<config::screenWidth;++x)
-      row[x]=brightness.apply(source[optics::sourceIndex(x/2,y/2,config::canvasWidth,config::mirrorForPrism)]);
-    display.writePixels(row,config::screenWidth);
+  // A logical pixel covers 2 x 2 panel pixels. Prepare both rows once.
+  uint16_t rows[2 * config::screenWidth];
+  display.startWrite();display.setAddrWindow(0,first,config::screenWidth,count);
+  for(unsigned y=first;y<first+count;y+=2) {
+    for(int x=0;x<config::canvasWidth;++x) {
+      const uint16_t pixel=brightness.apply(source[optics::sourceIndex(x,y/2,config::canvasWidth,config::mirrorForPrism)]);
+      rows[2*x]=rows[2*x+1]=pixel;
+    }
+    memcpy(rows+config::screenWidth,rows,config::screenWidth*sizeof(uint16_t));
+    display.writePixels(rows,2*config::screenWidth);
   }
   display.endWrite();
 }
@@ -283,14 +296,17 @@ void setup() {
   for(auto& button:buttons) button.begin();
   brightness.begin(config::imageGain,config::imageGamma);statuses.begin(millis());
   SPI.begin(config::tftSck,-1,config::tftMosi,config::tftCs);
-  display.init(config::screenWidth,config::screenHeight,SPI_MODE0);
-  display.setSPISpeed(config::spiHz);display.setRotation(0);display.invertDisplay(true);
-  canvas.setTextWrap(false);canvas.fillScreen(ST77XX_BLACK);centered(52,"LOADING",2);presentCanvas();
+  display.init(config::screenWidth,config::screenHeight,SPI_MODE3);
+  display.setRotation(0);display.invertDisplay(true);
+  display.setSPISpeed(config::tftDrawHz);
+  canvas.setTextWrap(false);canvas.fillScreen(ST77XX_BLACK);centered(52,"LOADING",2);
+  presentRows(0,config::screenHeight);
   storageOk=statisticsStore.begin(app.stats);
   commands=xQueueCreate(4,sizeof(protocol::Packet));
   bleOk=bluetooth.begin(commands);networkOk=networking.begin();
   if(!storageOk) showStatus(status::State::StorageError);
   Serial.printf("[boot] widgets ble=%u network=%u storage=%u heap=%u largest=%u\n",bleOk,networkOk,storageOk,unsigned(ESP.getFreeHeap()),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+  lastHealth=millis();
 }
 void loop() {
   const uint32_t now=millis();
@@ -326,9 +342,19 @@ void loop() {
   if(wasBleConnected!=bluetooth.connected()) {
     wasBleConnected=bluetooth.connected();showStatus(wasBleConnected?status::State::BleConnected:status::State::BleReady);
   }
-  if(uint32_t(now-lastFrame)>=100) {lastFrame=now;draw(now);presentCanvas();}
+  // Service buttons and USB between 40-row strips.
+  static unsigned nextRow=0;
+  static_assert(config::screenHeight%2==0, "2x scaling requires an even panel height");
+  if(nextRow==0) draw(now);
+  const unsigned rows=std::min(40u,config::screenHeight-nextRow);
+  presentRows(nextRow,rows);
+  nextRow+=rows;
+  if(nextRow==config::screenHeight) {nextRow=0;++completedFrames;}
   if(uint32_t(now-lastHealth)>=30000 && !usbOutputSize && Serial.availableForWrite()>=96) {
-    lastHealth=now;Serial.printf("[health] frame=ok heap=%u largest=%u\n",unsigned(ESP.getFreeHeap()),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+    const uint32_t measuredAt=millis();
+    const float fps=1000.0f*completedFrames/uint32_t(measuredAt-lastHealth);
+    lastHealth=measuredAt;completedFrames=0;
+    Serial.printf("[health] frame=ok fps=%.2f heap=%u largest=%u\n",fps,unsigned(ESP.getFreeHeap()),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
   }
   delay(1);
 }
