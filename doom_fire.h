@@ -22,6 +22,10 @@ class Animation {
     for (unsigned i = 0; i < 90; ++i) step();
   }
 
+  // For uncapped playback, advance the simulation once per completed frame.
+  void advanceFrame() { step(); }
+  uint16_t pixelAt(int x, int y) const { return palette[heat[y * size + x]]; }
+
   void render(uint32_t elapsedMs, uint16_t* output) {
     // 30 simulation ticks/s, independent of display refresh; bound catch-up.
     unsigned steps = (elapsedMs - lastStep) / 33;
@@ -32,7 +36,7 @@ class Animation {
     while (steps--) { step(); lastStep += 33; }
     for (int y = 0; y < outputSize; ++y)
       for (int x = 0; x < outputSize; ++x)
-        output[y * outputSize + x] = palette[heat[(y / 3) * size + x / 3]];
+        output[y * outputSize + x] = pixelAt(x / 3, y / 3);
   }
 
  private:
